@@ -6,7 +6,7 @@ const c = @cImport({
     @cInclude("X11/XKBlib.h");
 });
 
-// Predefined atoms — cimport doesn't expose these macros from Xlib.h.
+// cimport misses the XA_* macros, just hardcode 'em
 const XA_ATOM: c.Atom = 4;
 const XA_CARDINAL: c.Atom = 6;
 const XA_WINDOW: c.Atom = 33;
@@ -26,7 +26,6 @@ const Client = struct {
 const WM = struct {
     display: *c.Display,
     root: c.Window,
-    screen: c_int,
     clients: ?*Client = null,
     focused: ?*Client = null,
     allocator: std.mem.Allocator,
@@ -34,7 +33,7 @@ const WM = struct {
     wm_protocols: c.Atom = c.None,
     wm_delete: c.Atom = c.None,
 
-    // EWMH atoms for bar/tool detection and active window tracking.
+    // ewmh stuff — bars and fetch scripts read these off root
     ewmh_supported: c.Atom = c.None,
     ewmh_wm_name: c.Atom = c.None,
     ewmh_active_window: c.Atom = c.None,
@@ -43,13 +42,11 @@ const WM = struct {
 
     fn init(allocator: std.mem.Allocator) !WM {
         const display = c.XOpenDisplay(null) orelse return error.CannotOpenDisplay;
-        const screen = c.DefaultScreen(display);
-        const root = c.RootWindow(display, screen);
+        const root = c.RootWindow(display, c.DefaultScreen(display));
 
         return WM{
             .display = display,
             .root = root,
-            .screen = screen,
             .allocator = allocator,
         };
     }
@@ -63,11 +60,11 @@ const WM = struct {
 
         self.grabKeys();
 
-        // Intern once so closeWindow doesn't have to do it every time.
+        // intern once, reuse forever
         self.wm_protocols = c.XInternAtom(self.display, "WM_PROTOCOLS", 0);
         self.wm_delete = c.XInternAtom(self.display, "WM_DELETE_WINDOW", 0);
 
-        // EWMH — intern and advertise supported hints on the root window.
+        // ewmh — intern atoms and stamp them on root
         self.ewmh_supported = c.XInternAtom(self.display, "_NET_SUPPORTED", 0);
         self.ewmh_wm_name = c.XInternAtom(self.display, "_NET_WM_NAME", 0);
         self.ewmh_active_window = c.XInternAtom(self.display, "_NET_ACTIVE_WINDOW", 0);
@@ -76,7 +73,7 @@ const WM = struct {
 
         const utf8_string = c.XInternAtom(self.display, "UTF8_STRING", 0);
 
-        // _NET_WM_NAME — neofetch, screenfetch, bars all read this.
+        // how neofetch/bars know what wm you're running
         const wm_name = "kybngr";
         _ = c.XChangeProperty(
             self.display, self.root, self.ewmh_wm_name,
@@ -84,7 +81,7 @@ const WM = struct {
             @ptrCast(wm_name.ptr), wm_name.len,
         );
 
-        // _NET_SUPPORTED — list of EWMH hints we actually handle.
+        // tell everyone what we actually support
         const supported = [_]c.Atom{
             self.ewmh_supported,
             self.ewmh_wm_name,
@@ -98,8 +95,7 @@ const WM = struct {
             @ptrCast(&supported), supported.len,
         );
 
-        // _NET_DESKTOP_GEOMETRY and _NET_DESKTOP_VIEWPORT — set once here,
-        // updated again in tile() if the screen size changes.
+        // screen size for bars that want it
         var attrs: c.XWindowAttributes = undefined;
         _ = c.XGetWindowAttributes(self.display, self.root, &attrs);
         var geo = [2]c_long{ attrs.width, attrs.height };
@@ -119,7 +115,7 @@ const WM = struct {
     }
 
     fn grabKeys(self: *WM) void {
-        // Only two bindings live here. Everything else goes through sxhkd.
+        // everything else is sxhkd's problem
         const keys = [_]struct { key: c_uint, mod: c_uint }{
             .{ .key = c.XK_q, .mod = Config.mod_key },
             .{ .key = c.XK_q, .mod = Config.mod_key | c.ShiftMask },
@@ -128,8 +124,7 @@ const WM = struct {
             .{ .key = c.XK_m, .mod = Config.mod_key },
         };
 
-        // Grab with each common lock modifier so bindings work regardless
-        // of NumLock/CapsLock state.
+        // grab w/ lockmods so keys work w/ numlock/capslock on
         const noise: [3]c_uint = .{ 0, c.Mod2Mask, c.LockMask };
 
         for (keys) |k| {
@@ -157,7 +152,7 @@ const WM = struct {
     }
 
     fn onMapRequest(self: *WM, ev: *c.XMapRequestEvent) void {
-        // Already managed, just retile.
+        // already tracking this one, just retile
         var current = self.clients;
         while (current) |client| : (current = client.next) {
             if (client.window == ev.window) {
@@ -192,7 +187,7 @@ const WM = struct {
     fn onKeyPress(self: *WM, ev: *c.XKeyEvent) void {
         const keysym = c.XkbKeycodeToKeysym(self.display, @intCast(ev.keycode), 0, 0);
 
-        // Mask out lock keys before comparing.
+        // strip numlock/capslock/scrolllock noise
         const clean_state = ev.state & ~@as(c_uint, c.Mod2Mask | c.LockMask | c.Mod3Mask);
 
         if (keysym == c.XK_q and clean_state == Config.mod_key) {
@@ -210,21 +205,19 @@ const WM = struct {
         }
     }
 
-    // Focus the next client in the list, wrapping around.
+    // cycle focus forward, wrap at tail
     fn focusNext(self: *WM) void {
         const focused = self.focused orelse return;
         const next = focused.next orelse self.clients orelse return;
         self.focused = next;
-        _ = c.XSetInputFocus(self.display, next.window, c.RevertToPointerRoot, c.CurrentTime);
-        _ = c.XRaiseWindow(self.display, next.window);
         self.tile();
     }
 
-    // Focus the previous client in the list, wrapping around.
+    // cycle focus back, wrap at head
     fn focusPrev(self: *WM) void {
         const focused = self.focused orelse return;
 
-        // Find the node just before focused. If focused is head, wrap to tail.
+        // walk to the node before focused
         var prev: ?*Client = null;
         var current = self.clients;
         while (current) |client| : (current = client.next) {
@@ -234,7 +227,7 @@ const WM = struct {
             }
         }
 
-        // focused is head (or only client) — wrap to tail.
+        // wasn't found — focused is head, wrap to tail
         if (prev == null) {
             current = self.clients;
             while (current) |client| : (current = client.next) {
@@ -248,18 +241,16 @@ const WM = struct {
         const target = prev orelse return;
         if (target == focused) return; // only one client
         self.focused = target;
-        _ = c.XSetInputFocus(self.display, target.window, c.RevertToPointerRoot, c.CurrentTime);
-        _ = c.XRaiseWindow(self.display, target.window);
         self.tile();
     }
 
-    // Move focused window to the head of the client list, making it master.
+    // pull focused to head of list — that's master
     fn swapMaster(self: *WM) void {
         const focused = self.focused orelse return;
-        // Already master, nothing to do.
+        // already there
         if (self.clients == focused) return;
 
-        // Unlink focused from its current position.
+        // unlink it
         var prev = self.clients;
         while (prev) |p| {
             if (p.next == focused) {
@@ -269,13 +260,13 @@ const WM = struct {
             prev = p.next;
         }
 
-        // Prepend it.
+        // stick it at the front
         focused.next = self.clients;
         self.clients = focused;
         self.tile();
     }
 
-    // Try WM_DELETE_WINDOW first, fall back to XKillClient.
+    // polite close via WM_DELETE_WINDOW, nuke it if that fails
     fn closeWindow(self: *WM, window: c.Window) void {
         var protocols: [*c]c.Atom = undefined;
         var count: c_ulong = 0;
@@ -318,7 +309,7 @@ const WM = struct {
     }
 
     fn onConfigureRequest(self: *WM, ev: *c.XConfigureRequestEvent) void {
-        // Managed windows get their geometry from tile(), not from themselves.
+        // managed windows don't get to pick their own geometry
         var current = self.clients;
         while (current) |client| : (current = client.next) {
             if (client.window == ev.window) {
@@ -329,7 +320,7 @@ const WM = struct {
             }
         }
 
-        // Not yet managed — grant it so the app doesn't block.
+        // not ours yet — grant it or the app hangs
         var changes: c.XWindowChanges = undefined;
         changes.x = ev.x;
         changes.y = ev.y;
@@ -341,7 +332,7 @@ const WM = struct {
         _ = c.XConfigureWindow(self.display, ev.window, @intCast(ev.value_mask), &changes);
     }
 
-    // Update _NET_ACTIVE_WINDOW on the root so bars can track focus.
+    // update active window on root so bars can see what's focused
     fn updateActiveWindow(self: *WM) void {
         var window: c.Window = if (self.focused) |f| f.window else c.None;
         _ = c.XChangeProperty(
@@ -352,7 +343,7 @@ const WM = struct {
     }
 
     fn tile(self: *WM) void {
-        // Root window geometry is always current, even after xrandr changes.
+        // use root attrs — always current, even after xrandr
         var attrs: c.XWindowAttributes = undefined;
         _ = c.XGetWindowAttributes(self.display, self.root, &attrs);
         const screen_width = attrs.width;
@@ -372,7 +363,7 @@ const WM = struct {
         const usable_h: c_int = screen_height - 2 * Config.gap;
 
         if (count == 1) {
-            // Single window takes the whole screen.
+            // only one window — give it everything
             current = self.clients;
             if (current) |client| {
                 _ = c.XMoveResizeWindow(
@@ -385,7 +376,7 @@ const WM = struct {
                 _ = c.XSetWindowBorder(self.display, client.window, border_color);
             }
         } else {
-            // Master on the left, stack on the right.
+            // master left, stack right
             const master_w: c_int = @divTrunc(usable_w - Config.gap, 2);
             const stack_x: c_int = usable_x + master_w + Config.gap;
             const stack_w: c_int = usable_w - master_w - Config.gap;
