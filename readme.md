@@ -1,7 +1,6 @@
-# kybngr 'keybanger'
+# kybngr
 
-A minimal tiling window manager for X11, written in Zig. 
-(this is mostly for my own personal use & so i could learn zig, still a large wip)
+A minimal tiling window manager for X11, written in Zig. (not really meant for public use..)
 
 ## Dependencies
 
@@ -33,9 +32,12 @@ Everything is in the `Config` struct at the top of `kybngr.zig`. Change it, rebu
 
     Super+q        close focused window
     Super+Shift+q  quit
+    Super+j        focus next window
+    Super+k        focus previous window
+    Super+m        promote focused window to master
 
 All other keybindings should be configured in sxhkd. For example, to launch a
-terminal and browser.
+terminal and browser etc.
 
 ## Running
 
@@ -51,3 +53,15 @@ One window open: it takes the full screen.
 
 Two or more: the most recent window becomes master on the left half. All others
 stack vertically on the right. No mouse, no floating, no status bar.
+
+## Bar and tool compatibility
+
+kybngr sets the following EWMH properties on the root window:
+
+    _NET_WM_NAME           - reports "kybngr" to neofetch, screenfetch, bars, etc.
+    _NET_SUPPORTED         - advertises supported EWMH hints
+    _NET_ACTIVE_WINDOW     - updated on every focus change, for bar window lists
+    _NET_DESKTOP_GEOMETRY  - current screen size
+    _NET_DESKTOP_VIEWPORT  - current screen size
+
+Compositors shoudld work out of box now..
