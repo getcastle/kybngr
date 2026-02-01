@@ -1,4 +1,4 @@
-# kybngr
+# kybngr 'keybanger'
 
 A minimal tiling window manager for X11, written in Zig. (not really meant for public use..)
 
