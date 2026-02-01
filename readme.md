@@ -1,6 +1,7 @@
 # kybngr
 
-A minimal tiling window manager for X11, written in Zig.
+A minimal tiling window manager for X11, written in Zig. 
+(this is mostly for my own personal use & so i could learn zig, still a large wip)
 
 ## Dependencies
 
