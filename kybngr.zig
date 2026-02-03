@@ -433,17 +433,22 @@ const WM = struct {
     }
 
     fn onConfigureRequest(self: *WM, ev: *c.XConfigureRequestEvent) void {
-        // search all workspaces — X can send these for any managed window
+        // check current workspace first — most configure events are for visible windows
+        if (self.isWindowManaged(self.current, ev.window)) {
+            var changes: c.XWindowChanges = undefined;
+            changes.border_width = Config.border_width;
+            _ = c.XConfigureWindow(self.display, ev.window, c.CWBorderWidth, &changes);
+            return;
+        }
+
+        // search other workspaces
         for (0..Config.num_workspaces) |i| {
-            var current = self.workspaces[i].clients;
-            while (current) |client| : (current = client.next) {
-                if (client.window == ev.window) {
-                    // managed windows don't get to pick their own geometry
-                    var changes: c.XWindowChanges = undefined;
-                    changes.border_width = Config.border_width;
-                    _ = c.XConfigureWindow(self.display, ev.window, c.CWBorderWidth, &changes);
-                    return;
-                }
+            if (i == self.current) continue;
+            if (self.isWindowManaged(i, ev.window)) {
+                var changes: c.XWindowChanges = undefined;
+                changes.border_width = Config.border_width;
+                _ = c.XConfigureWindow(self.display, ev.window, c.CWBorderWidth, &changes);
+                return;
             }
         }
 
@@ -457,6 +462,14 @@ const WM = struct {
         changes.sibling = ev.above;
         changes.stack_mode = ev.detail;
         _ = c.XConfigureWindow(self.display, ev.window, @intCast(ev.value_mask), &changes);
+    }
+
+    fn isWindowManaged(self: *WM, ws_idx: usize, window: c.Window) bool {
+        var current = self.workspaces[ws_idx].clients;
+        while (current) |client| : (current = client.next) {
+            if (client.window == window) return true;
+        }
+        return false;
     }
 
     // update active window on root so bars can see what's focused
@@ -506,6 +519,7 @@ const WM = struct {
         const screen_width = attrs.width;
         const screen_height = attrs.height;
 
+        // count clients while we have the pointer anyway
         var count: usize = 0;
         var current = ws.clients;
         while (current) |_| : (current = current.?.next) {
@@ -536,7 +550,7 @@ const WM = struct {
                 _ = c.XSetWindowBorder(self.display, client.window, border_color);
             }
         } else {
-            // master left, stack right
+            // master left, stack right — precompute all layout values
             const master_w: c_int = @divTrunc(usable_w - Config.gap, 2);
             const stack_x: c_int = usable_x + master_w + Config.gap;
             const stack_w: c_int = usable_w - master_w - Config.gap;
@@ -585,32 +599,42 @@ const WM = struct {
 
     // search all workspaces for this window — it could be on any of them
     fn removeClient(self: *WM, window: c.Window) void {
+        // check current workspace first — most likely location
+        if (self.removeClientFromWorkspace(self.current, window)) return;
+
+        // not on current, search the rest
         for (0..Config.num_workspaces) |i| {
-            var prev: ?*Client = null;
-            var current = self.workspaces[i].clients;
-
-            while (current) |client| {
-                if (client.window == window) {
-                    if (prev) |p| {
-                        p.next = client.next;
-                    } else {
-                        self.workspaces[i].clients = client.next;
-                    }
-
-                    if (self.workspaces[i].focused == client) {
-                        self.workspaces[i].focused = self.workspaces[i].clients;
-                    }
-
-                    self.allocator.destroy(client);
-
-                    // only retile if it was on the visible workspace
-                    if (i == self.current) self.tile();
-                    return;
-                }
-                prev = client;
-                current = client.next;
-            }
+            if (i == self.current) continue;
+            if (self.removeClientFromWorkspace(i, window)) return;
         }
+    }
+
+    fn removeClientFromWorkspace(self: *WM, ws_idx: usize, window: c.Window) bool {
+        var prev: ?*Client = null;
+        var current = self.workspaces[ws_idx].clients;
+
+        while (current) |client| {
+            if (client.window == window) {
+                if (prev) |p| {
+                    p.next = client.next;
+                } else {
+                    self.workspaces[ws_idx].clients = client.next;
+                }
+
+                if (self.workspaces[ws_idx].focused == client) {
+                    self.workspaces[ws_idx].focused = self.workspaces[ws_idx].clients;
+                }
+
+                self.allocator.destroy(client);
+
+                // only retile if it was on the visible workspace
+                if (ws_idx == self.current) self.tile();
+                return true;
+            }
+            prev = client;
+            current = client.next;
+        }
+        return false;
     }
 
     fn deinit(self: *WM) void {
