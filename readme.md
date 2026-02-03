@@ -9,7 +9,6 @@ Master/stack layout. Keyboard-driven.
 - zig (0.15)
 - libx11
 - xorg-server-devel (for headers)
-- sxhkd (for spawning and other keybindings)
 
 On Arch:
 
