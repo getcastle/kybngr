@@ -1,6 +1,6 @@
 # kybngr 'keybanger'
 
-A minimal tiling window manager for X11, written in Zig.
+A minimal tiling window manager for X11, written in Zig. (mostly for my own person learning & usage)
 
 Master/stack layout. Keyboard-driven.
 
