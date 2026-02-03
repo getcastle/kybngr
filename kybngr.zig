@@ -10,12 +10,15 @@ const c = @cImport({
 const XA_ATOM: c.Atom = 4;
 const XA_CARDINAL: c.Atom = 6;
 const XA_WINDOW: c.Atom = 33;
+
+// Edit these, then rebuild.
 const Config = struct {
     const mod_key = c.Mod4Mask;
     const border_width = 2;
     const border_focus = 0x005577;
     const border_normal = 0x444444;
     const gap = 10;
+    const num_workspaces = 9;
 };
 
 const Client = struct {
@@ -23,12 +26,20 @@ const Client = struct {
     next: ?*Client = null,
 };
 
+const Workspace = struct {
+    clients: ?*Client = null,
+    focused: ?*Client = null,
+};
+
 const WM = struct {
     display: *c.Display,
     root: c.Window,
-    clients: ?*Client = null,
-    focused: ?*Client = null,
     allocator: std.mem.Allocator,
+
+    workspaces: [Config.num_workspaces]Workspace = [Config.num_workspaces]Workspace{
+        .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{},
+    },
+    current: usize = 0,
 
     wm_protocols: c.Atom = c.None,
     wm_delete: c.Atom = c.None,
@@ -39,6 +50,9 @@ const WM = struct {
     ewmh_active_window: c.Atom = c.None,
     ewmh_desktop_geometry: c.Atom = c.None,
     ewmh_desktop_viewport: c.Atom = c.None,
+    ewmh_current_desktop: c.Atom = c.None,
+    ewmh_desktop_names: c.Atom = c.None,
+    ewmh_number_of_desktops: c.Atom = c.None,
 
     fn init(allocator: std.mem.Allocator) !WM {
         const display = c.XOpenDisplay(null) orelse return error.CannotOpenDisplay;
@@ -70,6 +84,9 @@ const WM = struct {
         self.ewmh_active_window = c.XInternAtom(self.display, "_NET_ACTIVE_WINDOW", 0);
         self.ewmh_desktop_geometry = c.XInternAtom(self.display, "_NET_DESKTOP_GEOMETRY", 0);
         self.ewmh_desktop_viewport = c.XInternAtom(self.display, "_NET_DESKTOP_VIEWPORT", 0);
+        self.ewmh_current_desktop = c.XInternAtom(self.display, "_NET_CURRENT_DESKTOP", 0);
+        self.ewmh_desktop_names = c.XInternAtom(self.display, "_NET_DESKTOP_NAMES", 0);
+        self.ewmh_number_of_desktops = c.XInternAtom(self.display, "_NET_NUMBER_OF_DESKTOPS", 0);
 
         const utf8_string = c.XInternAtom(self.display, "UTF8_STRING", 0);
 
@@ -88,6 +105,9 @@ const WM = struct {
             self.ewmh_active_window,
             self.ewmh_desktop_geometry,
             self.ewmh_desktop_viewport,
+            self.ewmh_current_desktop,
+            self.ewmh_desktop_names,
+            self.ewmh_number_of_desktops,
         };
         _ = c.XChangeProperty(
             self.display, self.root, self.ewmh_supported,
@@ -109,6 +129,16 @@ const WM = struct {
             XA_CARDINAL, 32, c.PropModeReplace,
             @ptrCast(&geo), 2,
         );
+
+        // workspace ewmh props
+        var num_desktops: c_long = Config.num_workspaces;
+        _ = c.XChangeProperty(
+            self.display, self.root, self.ewmh_number_of_desktops,
+            XA_CARDINAL, 32, c.PropModeReplace,
+            @ptrCast(&num_desktops), 1,
+        );
+        self.updateCurrentDesktop();
+        self.updateDesktopNames();
 
         _ = c.XSetErrorHandler(errorHandler);
         _ = c.XSync(self.display, 0);
@@ -133,6 +163,26 @@ const WM = struct {
                 _ = c.XGrabKey(self.display, keycode, k.mod | n, self.root, 1, c.GrabModeAsync, c.GrabModeAsync);
             }
         }
+
+        // workspace keys: Super+1-9 and Super+Shift+1-9
+        const ws_keys = [_]struct { key: c_uint, mod: c_uint, mod_shift: c_uint }{ 
+            .{ .key = c.XK_1, .mod = Config.mod_key, .mod_shift = Config.mod_key | c.ShiftMask },
+            .{ .key = c.XK_2, .mod = Config.mod_key, .mod_shift = Config.mod_key | c.ShiftMask },
+            .{ .key = c.XK_3, .mod = Config.mod_key, .mod_shift = Config.mod_key | c.ShiftMask },
+            .{ .key = c.XK_4, .mod = Config.mod_key, .mod_shift = Config.mod_key | c.ShiftMask },
+            .{ .key = c.XK_5, .mod = Config.mod_key, .mod_shift = Config.mod_key | c.ShiftMask },
+            .{ .key = c.XK_6, .mod = Config.mod_key, .mod_shift = Config.mod_key | c.ShiftMask },
+            .{ .key = c.XK_7, .mod = Config.mod_key, .mod_shift = Config.mod_key | c.ShiftMask },
+            .{ .key = c.XK_8, .mod = Config.mod_key, .mod_shift = Config.mod_key | c.ShiftMask },
+            .{ .key = c.XK_9, .mod = Config.mod_key, .mod_shift = Config.mod_key | c.ShiftMask },
+        };
+        for (ws_keys) |wsk| {
+            const keycode = c.XKeysymToKeycode(self.display, wsk.key);
+            for (noise) |n| {
+                _ = c.XGrabKey(self.display, keycode, wsk.mod | n, self.root, 1, c.GrabModeAsync, c.GrabModeAsync);
+                _ = c.XGrabKey(self.display, keycode, wsk.mod_shift | n, self.root, 1, c.GrabModeAsync, c.GrabModeAsync);
+            }
+        }
     }
 
     fn run(self: *WM) !void {
@@ -152,8 +202,10 @@ const WM = struct {
     }
 
     fn onMapRequest(self: *WM, ev: *c.XMapRequestEvent) void {
+        const ws = &self.workspaces[self.current];
+
         // already tracking this one, just retile
-        var current = self.clients;
+        var current = ws.clients;
         while (current) |client| : (current = client.next) {
             if (client.window == ev.window) {
                 self.tile();
@@ -164,19 +216,22 @@ const WM = struct {
         const client = self.allocator.create(Client) catch return;
         client.* = .{ .window = ev.window };
 
-        client.next = self.clients;
-        self.clients = client;
+        client.next = ws.clients;
+        ws.clients = client;
 
         _ = c.XSetWindowBorderWidth(self.display, client.window, Config.border_width);
         _ = c.XSetWindowBorder(self.display, client.window, Config.border_normal);
         _ = c.XSelectInput(self.display, client.window, c.EnterWindowMask | c.FocusChangeMask);
         _ = c.XMapWindow(self.display, client.window);
 
-        self.focused = client;
+        ws.focused = client;
         self.tile();
     }
 
     fn onUnmapNotify(self: *WM, ev: *c.XUnmapEvent) void {
+        // if the window still exists we unmapped it ourselves (ws switch) — ignore
+        var attrs: c.XWindowAttributes = undefined;
+        if (c.XGetWindowAttributes(self.display, ev.window, &attrs) != 0) return;
         self.removeClient(ev.window);
     }
 
@@ -191,7 +246,7 @@ const WM = struct {
         const clean_state = ev.state & ~@as(c_uint, c.Mod2Mask | c.LockMask | c.Mod3Mask);
 
         if (keysym == c.XK_q and clean_state == Config.mod_key) {
-            if (self.focused) |client| {
+            if (self.workspaces[self.current].focused) |client| {
                 self.closeWindow(client.window);
             }
         } else if (keysym == c.XK_q and clean_state == (Config.mod_key | c.ShiftMask)) {
@@ -202,24 +257,35 @@ const WM = struct {
             self.focusPrev();
         } else if (keysym == c.XK_m and clean_state == Config.mod_key) {
             self.swapMaster();
+        } else if (keysym >= c.XK_1 and keysym <= c.XK_9) {
+            const idx = @as(usize, @intCast(keysym - c.XK_1));
+            if (idx < Config.num_workspaces) {
+                if (clean_state == Config.mod_key) {
+                    self.switchWorkspace(idx);
+                } else if (clean_state == (Config.mod_key | c.ShiftMask)) {
+                    self.moveToWorkspace(idx);
+                }
+            }
         }
     }
 
     // cycle focus forward, wrap at tail
     fn focusNext(self: *WM) void {
-        const focused = self.focused orelse return;
-        const next = focused.next orelse self.clients orelse return;
-        self.focused = next;
+        const ws = &self.workspaces[self.current];
+        const focused = ws.focused orelse return;
+        const next = focused.next orelse ws.clients orelse return;
+        ws.focused = next;
         self.tile();
     }
 
     // cycle focus back, wrap at head
     fn focusPrev(self: *WM) void {
-        const focused = self.focused orelse return;
+        const ws = &self.workspaces[self.current];
+        const focused = ws.focused orelse return;
 
         // walk to the node before focused
         var prev: ?*Client = null;
-        var current = self.clients;
+        var current = ws.clients;
         while (current) |client| : (current = client.next) {
             if (client.next == focused) {
                 prev = client;
@@ -229,7 +295,7 @@ const WM = struct {
 
         // wasn't found — focused is head, wrap to tail
         if (prev == null) {
-            current = self.clients;
+            current = ws.clients;
             while (current) |client| : (current = client.next) {
                 if (client.next == null) {
                     prev = client;
@@ -240,18 +306,19 @@ const WM = struct {
 
         const target = prev orelse return;
         if (target == focused) return; // only one client
-        self.focused = target;
+        ws.focused = target;
         self.tile();
     }
 
     // pull focused to head of list — that's master
     fn swapMaster(self: *WM) void {
-        const focused = self.focused orelse return;
+        const ws = &self.workspaces[self.current];
+        const focused = ws.focused orelse return;
         // already there
-        if (self.clients == focused) return;
+        if (ws.clients == focused) return;
 
         // unlink it
-        var prev = self.clients;
+        var prev = ws.clients;
         while (prev) |p| {
             if (p.next == focused) {
                 p.next = focused.next;
@@ -261,8 +328,65 @@ const WM = struct {
         }
 
         // stick it at the front
-        focused.next = self.clients;
-        self.clients = focused;
+        focused.next = ws.clients;
+        ws.clients = focused;
+        self.tile();
+    }
+
+    // hide everything on current ws, show everything on target ws
+    fn switchWorkspace(self: *WM, target: usize) void {
+        if (target == self.current) return;
+
+        // unmap all windows on current workspace
+        var current = self.workspaces[self.current].clients;
+        while (current) |client| : (current = client.next) {
+            _ = c.XUnmapWindow(self.display, client.window);
+        }
+
+        self.current = target;
+
+        // map all windows on new workspace and tile
+        current = self.workspaces[self.current].clients;
+        while (current) |client| : (current = client.next) {
+            _ = c.XMapWindow(self.display, client.window);
+        }
+
+        self.tile();
+        self.updateCurrentDesktop();
+    }
+
+    // move focused window from current ws to target ws
+    fn moveToWorkspace(self: *WM, target: usize) void {
+        if (target == self.current) return;
+        const ws = &self.workspaces[self.current];
+        const focused = ws.focused orelse return;
+
+        // unlink from current
+        var prev: ?*Client = null;
+        var current = ws.clients;
+        while (current) |client| : (current = client.next) {
+            if (client == focused) {
+                if (prev) |p| {
+                    p.next = client.next;
+                } else {
+                    ws.clients = client.next;
+                }
+                break;
+            }
+            prev = client;
+        }
+
+        // update focus on current ws
+        ws.focused = ws.clients;
+
+        // hide it
+        _ = c.XUnmapWindow(self.display, focused.window);
+
+        // prepend onto target ws
+        focused.next = self.workspaces[target].clients;
+        self.workspaces[target].clients = focused;
+        self.workspaces[target].focused = focused;
+
         self.tile();
     }
 
@@ -309,14 +433,17 @@ const WM = struct {
     }
 
     fn onConfigureRequest(self: *WM, ev: *c.XConfigureRequestEvent) void {
-        // managed windows don't get to pick their own geometry
-        var current = self.clients;
-        while (current) |client| : (current = client.next) {
-            if (client.window == ev.window) {
-                var changes: c.XWindowChanges = undefined;
-                changes.border_width = Config.border_width;
-                _ = c.XConfigureWindow(self.display, ev.window, c.CWBorderWidth, &changes);
-                return;
+        // search all workspaces — X can send these for any managed window
+        for (0..Config.num_workspaces) |i| {
+            var current = self.workspaces[i].clients;
+            while (current) |client| : (current = client.next) {
+                if (client.window == ev.window) {
+                    // managed windows don't get to pick their own geometry
+                    var changes: c.XWindowChanges = undefined;
+                    changes.border_width = Config.border_width;
+                    _ = c.XConfigureWindow(self.display, ev.window, c.CWBorderWidth, &changes);
+                    return;
+                }
             }
         }
 
@@ -334,7 +461,7 @@ const WM = struct {
 
     // update active window on root so bars can see what's focused
     fn updateActiveWindow(self: *WM) void {
-        var window: c.Window = if (self.focused) |f| f.window else c.None;
+        var window: c.Window = if (self.workspaces[self.current].focused) |f| f.window else c.None;
         _ = c.XChangeProperty(
             self.display, self.root, self.ewmh_active_window,
             XA_WINDOW, 32, c.PropModeReplace,
@@ -342,7 +469,37 @@ const WM = struct {
         );
     }
 
+    fn updateCurrentDesktop(self: *WM) void {
+        var desktop: c_long = @intCast(self.current);
+        _ = c.XChangeProperty(
+            self.display, self.root, self.ewmh_current_desktop,
+            XA_CARDINAL, 32, c.PropModeReplace,
+            @ptrCast(&desktop), 1,
+        );
+    }
+
+    // null-separated workspace names for bars
+    fn updateDesktopNames(self: *WM) void {
+        const utf8_string = c.XInternAtom(self.display, "UTF8_STRING", 0);
+        // "1\x000\x002\x00..." — each name is just the number
+        var buf: [Config.num_workspaces * 2]u8 = undefined;
+        var len: usize = 0;
+        for (0..Config.num_workspaces) |i| {
+            buf[len] = @intCast('1' + i);
+            len += 1;
+            buf[len] = 0;
+            len += 1;
+        }
+        _ = c.XChangeProperty(
+            self.display, self.root, self.ewmh_desktop_names,
+            utf8_string, 8, c.PropModeReplace,
+            @ptrCast(&buf), @intCast(len),
+        );
+    }
+
     fn tile(self: *WM) void {
+        const ws = &self.workspaces[self.current];
+
         // use root attrs — always current, even after xrandr
         var attrs: c.XWindowAttributes = undefined;
         _ = c.XGetWindowAttributes(self.display, self.root, &attrs);
@@ -350,12 +507,15 @@ const WM = struct {
         const screen_height = attrs.height;
 
         var count: usize = 0;
-        var current = self.clients;
+        var current = ws.clients;
         while (current) |_| : (current = current.?.next) {
             count += 1;
         }
 
-        if (count == 0) return;
+        if (count == 0) {
+            self.updateActiveWindow();
+            return;
+        }
 
         const usable_x: c_int = Config.gap;
         const usable_y: c_int = Config.gap;
@@ -364,7 +524,7 @@ const WM = struct {
 
         if (count == 1) {
             // only one window — give it everything
-            current = self.clients;
+            current = ws.clients;
             if (current) |client| {
                 _ = c.XMoveResizeWindow(
                     self.display, client.window,
@@ -372,7 +532,7 @@ const WM = struct {
                     @intCast(usable_w - 2 * Config.border_width),
                     @intCast(usable_h - 2 * Config.border_width),
                 );
-                const border_color: c_ulong = if (client == self.focused) Config.border_focus else Config.border_normal;
+                const border_color: c_ulong = if (client == ws.focused) Config.border_focus else Config.border_normal;
                 _ = c.XSetWindowBorder(self.display, client.window, border_color);
             }
         } else {
@@ -386,7 +546,7 @@ const WM = struct {
             );
 
             var i: usize = 0;
-            current = self.clients;
+            current = ws.clients;
             while (current) |client| : (current = client.next) {
                 if (i == 0) {
                     _ = c.XMoveResizeWindow(
@@ -408,14 +568,14 @@ const WM = struct {
                     );
                 }
 
-                const border_color: c_ulong = if (client == self.focused) Config.border_focus else Config.border_normal;
+                const border_color: c_ulong = if (client == ws.focused) Config.border_focus else Config.border_normal;
                 _ = c.XSetWindowBorder(self.display, client.window, border_color);
 
                 i += 1;
             }
         }
 
-        if (self.focused) |focused| {
+        if (ws.focused) |focused| {
             _ = c.XSetInputFocus(self.display, focused.window, c.RevertToPointerRoot, c.CurrentTime);
             _ = c.XRaiseWindow(self.display, focused.window);
         }
@@ -423,28 +583,33 @@ const WM = struct {
         self.updateActiveWindow();
     }
 
+    // search all workspaces for this window — it could be on any of them
     fn removeClient(self: *WM, window: c.Window) void {
-        var prev: ?*Client = null;
-        var current = self.clients;
+        for (0..Config.num_workspaces) |i| {
+            var prev: ?*Client = null;
+            var current = self.workspaces[i].clients;
 
-        while (current) |client| {
-            if (client.window == window) {
-                if (prev) |p| {
-                    p.next = client.next;
-                } else {
-                    self.clients = client.next;
+            while (current) |client| {
+                if (client.window == window) {
+                    if (prev) |p| {
+                        p.next = client.next;
+                    } else {
+                        self.workspaces[i].clients = client.next;
+                    }
+
+                    if (self.workspaces[i].focused == client) {
+                        self.workspaces[i].focused = self.workspaces[i].clients;
+                    }
+
+                    self.allocator.destroy(client);
+
+                    // only retile if it was on the visible workspace
+                    if (i == self.current) self.tile();
+                    return;
                 }
-
-                if (self.focused == client) {
-                    self.focused = self.clients;
-                }
-
-                self.allocator.destroy(client);
-                self.tile();
-                return;
+                prev = client;
+                current = client.next;
             }
-            prev = client;
-            current = client.next;
         }
     }
 
