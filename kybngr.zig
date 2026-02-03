@@ -213,6 +213,12 @@ const WM = struct {
             }
         }
 
+        // check if this is a popup/tooltip/splash we shouldn't manage
+        if (!self.shouldManage(ev.window)) {
+            _ = c.XMapWindow(self.display, ev.window);
+            return;
+        }
+
         const client = self.allocator.create(Client) catch return;
         client.* = .{ .window = ev.window };
 
@@ -226,6 +232,51 @@ const WM = struct {
 
         ws.focused = client;
         self.tile();
+    }
+
+    // check if a window should be tiled or left alone (tooltips, popups, etc)
+    fn shouldManage(self: *WM, window: c.Window) bool {
+        var attrs: c.XWindowAttributes = undefined;
+        if (c.XGetWindowAttributes(self.display, window, &attrs) == 0) return false;
+
+        // override_redirect means X handles it (menus, tooltips)
+        if (attrs.override_redirect != 0) return false;
+
+        // check _NET_WM_WINDOW_TYPE
+        var actual_type: c.Atom = undefined;
+        var actual_format: c_int = undefined;
+        var nitems: c_ulong = 0;
+        var bytes_after: c_ulong = 0;
+        var prop: [*c]c.Atom = undefined;
+
+        const net_wm_window_type = c.XInternAtom(self.display, "_NET_WM_WINDOW_TYPE", 0);
+        if (c.XGetWindowProperty(
+            self.display, window, net_wm_window_type,
+            0, 1, 0, XA_ATOM,
+            &actual_type, &actual_format, &nitems, &bytes_after,
+            @ptrCast(&prop),
+        ) == c.Success and nitems > 0) {
+            const window_type = prop[0];
+            _ = c.XFree(@ptrCast(prop));
+
+            // types we should NOT tile
+            const ignored_types = [_][]const u8{
+                "_NET_WM_WINDOW_TYPE_TOOLTIP",
+                "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+                "_NET_WM_WINDOW_TYPE_POPUP_MENU",
+                "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
+                "_NET_WM_WINDOW_TYPE_COMBO",
+                "_NET_WM_WINDOW_TYPE_DND",
+                "_NET_WM_WINDOW_TYPE_SPLASH",
+            };
+
+            for (ignored_types) |type_name| {
+                const atom = c.XInternAtom(self.display, type_name.ptr, 0);
+                if (window_type == atom) return false;
+            }
+        }
+
+        return true;
     }
 
     fn onUnmapNotify(self: *WM, ev: *c.XUnmapEvent) void {
