@@ -12,7 +12,7 @@ Master/stack layout. Keyboard-driven.
 
 On Arch:
 
-    sudo pacman -S zig libx11 xorg-server-devel sxhkd
+    sudo pacman -S zig libx11 xorg-server-devel
 
 ## Building
 
